@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "single-rollout-async-optimization"
+version = "0.1.0"
+description = "Open-source SAO implementation and AReaL integration"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = {text = "Apache-2.0"}
+dependencies = [
+  "torch>=2.4",
+  "PyYAML>=6",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "ruff>=0.9",
+]
+data = [
+  "datasets>=3",
+  "math-verify==0.8.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["sao*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+pythonpath = ["."]
+markers = [
+  "gpu: requires a CUDA GPU and a model checkpoint",
+  "integration: requires a patched AReaL checkout",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

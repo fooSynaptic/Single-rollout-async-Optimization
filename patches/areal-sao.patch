@@ -1,0 +1,1979 @@
+diff --git a/areal/api/cli_args.py b/areal/api/cli_args.py
+index 50d05aa..6c9822d 100644
+--- a/areal/api/cli_args.py
++++ b/areal/api/cli_args.py
+@@ -46,8 +46,15 @@ class NormConfig:
+     mean_level: str | None = field(
+         default="batch",
+         metadata={
+-            "help": "Mean level for normalization. None for no mean normalization.",
+-            "choices": ["batch", "group", None],
++            "help": "Mean level for normalization. None for no mean normalization. "
++            "'running' = sliding-window mean baseline (see running_window).",
++            "choices": ["batch", "group", "running", None],
++        },
++    )
++    running_window: int = field(
++        default=128,
++        metadata={
++            "help": "Window size for mean_level='running' (number of recent batch means)."
+         },
+     )
+     mean_leave1out: bool = field(
+@@ -79,15 +86,21 @@ class NormConfig:
+ 
+     def __post_init__(self):
+         """Validate normalization configuration."""
+-        valid_levels = {"batch", "group", None}
++        valid_levels = {"batch", "group", "running", None}
+         if self.mean_level not in valid_levels:
+             raise ValueError(
+-                f"mean_level must be 'batch', 'group' or None, got {self.mean_level}"
++                f"mean_level must be 'batch', 'group', 'running' or None, "
++                f"got {self.mean_level}"
+             )
+-        if self.std_level not in valid_levels:
++        if self.std_level not in {"batch", "group", None}:
+             raise ValueError(
+                 f"std_level must be 'batch', 'group', or None, got {self.std_level}"
+             )
++        if self.mean_level == "running" and self.running_window < 1:
++            raise ValueError(
++                f"running_window must be >= 1 when mean_level='running', "
++                f"got {self.running_window}"
++            )
+         if (
+             self.mean_level == "group" or self.std_level == "group"
+         ) and self.group_size < 1:
+@@ -3126,6 +3139,99 @@ class TeacherConfig:
+             )
+ 
+ 
++@dataclass
++class FSRewardWorkerConfig:
++    """One shared FS reward consumer host (CPU-only, fixed shard)."""
++
++    host: str = field(
++        default="worker-0",
++        metadata={"help": "SSH alias / hostname for the reward worker."},
++    )
++    shard: int = field(default=0, metadata={"help": "Fixed shard id this host owns."})
++    concurrency: int = field(
++        default=48,
++        metadata={"help": "Local ProcessPool size for math_verify on this host."},
++    )
++
++
++@dataclass
++class FSRewardConfig:
++    """File-based sharded reward offload via shared shared FS (no RPC)."""
++
++    root: str = field(
++        default=os.environ.get("REWARD_ROOT", "./reward"),
++        metadata={
++            "help": "shared FS root prefix. Launch scripts append experiment/trial/run_id."
++        },
++    )
++    run_id: str | None = field(
++        default=None,
++        metadata={
++            "help": "Immutable run id. Set by launch script; do not reuse across trials."
++        },
++    )
++    shard_count: int = field(default=2, metadata={"help": "Number of fixed shards."})
++    poll_interval_ms: float = field(
++        default=50.0, metadata={"help": "Client poll interval for outbox files."}
++    )
++    heartbeat_stale_seconds: float = field(
++        default=15.0,
++        metadata={"help": "Fail if worker heartbeat older than this many seconds."},
++    )
++    task_ttl_seconds: float = field(
++        default=600.0,
++        metadata={"help": "Orphan inbox/outbox TTL for background cleanup."},
++    )
++    workers: list[FSRewardWorkerConfig] = field(
++        default_factory=lambda: [
++            FSRewardWorkerConfig(host="worker-0", shard=0, concurrency=48),
++            FSRewardWorkerConfig(host="worker-1", shard=1, concurrency=48),
++        ],
++        metadata={"help": "CPU reward worker assignments."},
++    )
++
++
++@dataclass
++class RewardConfig:
++    """Reward execution backend for RLVR workflows."""
++
++    backend: str = field(
++        default="local",
++        metadata={
++            "help": "Reward backend: 'local' (AsyncRewardWrapper ProcessPool) or "
++            "'fs_shard' (file inbox/outbox on shared FS; consumers on train workers)."
++        },
++    )
++    timeout_seconds: float = field(
++        default=15.0,
++        metadata={
++            "help": "Per-task timeout. Local backend defaults historically to 15s; "
++            "fs_shard typically uses 30s."
++        },
++    )
++    max_retries: int = field(
++        default=3,
++        metadata={
++            "help": "Local backend retries on timeout. Prefer 0 for fs_shard."
++        },
++    )
++    on_error: str = field(
++        default="raise",
++        metadata={
++            "help": "On shared FS infra failure: 'raise' (fail training) or 'zero' "
++            "(smoke only; pollutes incorrect_n_seqs)."
++        },
++    )
++    max_workers: int | None = field(
++        default=None,
++        metadata={"help": "Local ProcessPool max_workers override."},
++    )
++    fs_shard: FSRewardConfig = field(
++        default_factory=FSRewardConfig,
++        metadata={"help": "Settings used when backend=fs_shard."},
++    )
++
++
+ @dataclass
+ class PPOConfig(BaseExperimentConfig):
+     """Configuration for Proximal Policy Optimization (PPO) reinforcement learning experiments."""
+@@ -3154,6 +3260,12 @@ class PPOConfig(BaseExperimentConfig):
+             )
+         },
+     )
++    reward: RewardConfig = field(
++        default_factory=RewardConfig,
++        metadata={
++            "help": "Reward execution backend (local ProcessPool or shared FS sharded)."
++        },
++    )
+     dynamic_bs: bool = field(
+         default=False,
+         metadata={
+diff --git a/areal/api/reward_api.py b/areal/api/reward_api.py
+index 44bef1f..a50f577 100644
+--- a/areal/api/reward_api.py
++++ b/areal/api/reward_api.py
+@@ -8,6 +8,7 @@ from collections.abc import Callable
+ from concurrent.futures import ProcessPoolExecutor
+ from concurrent.futures.process import BrokenProcessPool
+ from functools import partial
++from typing import Any
+ 
+ from areal.utils import logging
+ 
+@@ -181,3 +182,80 @@ class AsyncRewardWrapper:
+                     raise
+ 
+         return 0
++
++
++def build_async_reward_executor(
++    reward_fn: Callable[..., Any] | str,
++    reward_config: Any | None = None,
++):
++    """Factory for local ProcessPool or shared FS sharded reward executors.
++
++    Parameters
++    ----------
++    reward_fn:
++        Callable or import-path string. shared FS backend requires a string.
++    reward_config:
++        ``RewardConfig`` instance or None (defaults to local backend).
++    """
++    backend = "local"
++    timeout_seconds = 15.0
++    max_retries = 3
++    max_workers = None
++    on_error = "raise"
++    fs = None
++    if reward_config is not None:
++        backend = getattr(reward_config, "backend", "local")
++        timeout_seconds = float(getattr(reward_config, "timeout_seconds", 15.0))
++        max_retries = int(getattr(reward_config, "max_retries", 3))
++        max_workers = getattr(reward_config, "max_workers", None)
++        on_error = getattr(reward_config, "on_error", "raise")
++        fs = getattr(reward_config, "fs_shard", None)
++
++    if backend in (None, "local"):
++        if isinstance(reward_fn, str):
++            from areal.utils.dynamic_import import import_from_string
++
++            reward_fn = import_from_string(reward_fn)
++        return AsyncRewardWrapper(
++            reward_fn,
++            timeout_seconds=timeout_seconds,
++            max_workers=max_workers,
++            max_retries=max_retries,
++        )
++
++    if backend == "fs_shard":
++        if not isinstance(reward_fn, str):
++            raise TypeError(
++                "backend=fs_shard requires reward_fn as an import path string "
++                "(callables are not sent over shared FS)"
++            )
++        if fs is None:
++            raise ValueError(
++                "reward.fs_shard config is required for backend=fs_shard"
++            )
++        from areal.reward.fs_client import FSRewardClient
++
++        root_str = str(getattr(fs, "root"))
++        workers = list(getattr(fs, "workers", []) or [])
++        hosts = []
++        for w in workers:
++            if isinstance(w, dict):
++                h = w.get("host")
++            else:
++                h = getattr(w, "host", None)
++            if h:
++                hosts.append(h)
++        return FSRewardClient(
++            reward_fn,
++            root=root_str,
++            shard_count=int(getattr(fs, "shard_count", 2)),
++            timeout_seconds=timeout_seconds,
++            poll_interval_ms=float(getattr(fs, "poll_interval_ms", 50.0)),
++            on_error=on_error,
++            heartbeat_stale_seconds=float(
++                getattr(fs, "heartbeat_stale_seconds", 15.0)
++            ),
++            worker_hosts=hosts,
++        )
++
++    raise ValueError(f"Unknown reward.backend={backend!r}; use 'local' or 'fs_shard'")
+diff --git a/areal/infra/utils/ray_placement_group.py b/areal/infra/utils/ray_placement_group.py
+index 4372ef0..5dc7c24 100644
+--- a/areal/infra/utils/ray_placement_group.py
++++ b/areal/infra/utils/ray_placement_group.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ import abc
++import os
+ from dataclasses import dataclass, field
+ from typing import Any
+ 
+@@ -101,6 +102,20 @@ def _create_placement_group(role: str, bundles: list[dict], timeout) -> Placemen
+     """
+     Helper to create and wait for a placement group
+     """
++    # Optional SAO pin: head advertises sao_rollout, workers sao_train
++    # (see launch scripts with SAO_PIN_ROLES=1) so train stays off head's
++    # 4 rollout GPUs.
++    pin = None
++    if os.environ.get("SAO_PIN_ROLES", "").strip() in ("1", "true", "True", "yes"):
++        rl = (role or "").lower()
++        if rl in ("actor", "critic", "ref", "teacher") or rl.startswith("actor"):
++            pin = "sao_train"
++        elif "rollout" in rl:
++            pin = "sao_rollout"
++    if pin:
++        bundles = [{**b, pin: 0.001} for b in bundles]
++        logger.info(f"SAO_PIN_ROLES: role={role} bundles += {pin}=0.001")
++
+     pg = placement_group(bundles=bundles, strategy="PACK")
+     try:
+         ray.get(pg.ready(), timeout=timeout)
+diff --git a/areal/reward/__init__.py b/areal/reward/__init__.py
+index d6b8e42..9df9092 100644
+--- a/areal/reward/__init__.py
++++ b/areal/reward/__init__.py
+@@ -1,6 +1,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ import concurrent.futures
++import os
++import sys
++from multiprocessing import get_context
+ 
+ from math_verify.grader import verify as math_verify_verify
+ from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig, parse
+@@ -9,6 +12,66 @@ from areal.utils import logging
+ 
+ logger = logging.getLogger("RewardUtils")
+ 
++# Process-pool used only for hard deadlines on Linux (avoids stuck threads).
++_VERIFY_POOL: concurrent.futures.ProcessPoolExecutor | None = None
++_VERIFY_TIMEOUT_COUNT = 0
++
++
++def get_verify_timeout_count() -> int:
++    return _VERIFY_TIMEOUT_COUNT
++
++
++def _verify_impl_standalone(
++    response: str,
++    ground_truth: str,
++    try_extract_without_anchor: bool,
++    precision: int,
++) -> float:
++    """Picklable top-level verify for ProcessPool hard timeout."""
++    gold_extraction_target = (
++        ExprExtractionConfig(try_extract_without_anchor=try_extract_without_anchor),
++        LatexExtractionConfig(),
++    )
++    pred_extraction_target = (
++        ExprExtractionConfig(try_extract_without_anchor=try_extract_without_anchor),
++        LatexExtractionConfig(),
++    )
++    gold_parsed = parse(
++        ground_truth,
++        extraction_config=gold_extraction_target,
++        parsing_timeout=None,
++    )
++    pred_parsed = parse(
++        response,
++        extraction_config=pred_extraction_target,
++        parsing_timeout=None,
++    )
++    if not gold_parsed or not pred_parsed:
++        return 0.0
++    result = math_verify_verify(
++        gold_parsed,
++        pred_parsed,
++        float_rounding=precision,
++        timeout_seconds=None,
++    )
++    return 1.0 if result else 0.0
++
++
++def _get_verify_pool() -> concurrent.futures.ProcessPoolExecutor:
++    global _VERIFY_POOL
++    if _VERIFY_POOL is None:
++        # Py3.11+: max_tasks_per_child is incompatible with fork; must use spawn/forkserver.
++        # spawn also avoids nested-fork issues when already inside a shared FS ProcessPool worker.
++        if sys.platform.startswith("linux"):
++            ctx = get_context("spawn")
++        else:
++            ctx = get_context()
++        kwargs: dict = {"max_workers": 1, "mp_context": ctx}
++        if sys.version_info >= (3, 11):
++            kwargs["max_tasks_per_child"] = 64
++        _VERIFY_POOL = concurrent.futures.ProcessPoolExecutor(**kwargs)
++    return _VERIFY_POOL
++
+ 
+ class MathVerifyWorker:
+     """Thin wrapper over math_verify with configurable extraction/precision.
+@@ -16,19 +79,11 @@ class MathVerifyWorker:
+     Uses ``parse()`` + ``verify()`` directly instead of ``math_metric()``
+     so that signal-based timeouts can be disabled (``parsing_timeout=None``,
+     ``timeout_seconds=None``). This avoids ``signal.alarm()`` which only
+-    works in the main thread. A thread-safe timeout is enforced via
+-    ``concurrent.futures`` instead.
+-
+-    Args:
+-        try_extract_without_anchor: When False, only answers with explicit anchors
+-            (e.g., "answer = 1", "final answer = 1") are matched. When True,
+-            any numeric string in the text may be extracted.
+-        precision: Number of significant digits that must match.
+-        timeout: Thread-safe timeout in seconds for the entire verify call
+-            (parsing + comparison). ``None`` disables the timeout.
+-
+-    Notes:
+-        Tune these knobs based on dataset format and model output style.
++    works in the main thread.
++
++    On Linux, timeout uses a single-worker ProcessPool so hung verifies can be
++    abandoned without permanently occupying a thread. Other platforms fall back
++    to ThreadPoolExecutor (soft timeout).
+     """
+ 
+     def __init__(
+@@ -45,6 +100,7 @@ class MathVerifyWorker:
+             ExprExtractionConfig(try_extract_without_anchor=try_extract_without_anchor),
+             LatexExtractionConfig(),
+         )
++        self.try_extract_without_anchor = try_extract_without_anchor
+         self.precision = precision
+         self.timeout = timeout
+ 
+@@ -71,13 +127,47 @@ class MathVerifyWorker:
+         return 1.0 if result else 0.0
+ 
+     def verify(self, response: str, ground_truth: str) -> float:
++        global _VERIFY_TIMEOUT_COUNT
+         try:
+             if self.timeout is None:
+                 return self._verify_impl(response, ground_truth)
++
++            use_process = sys.platform.startswith("linux") and os.environ.get(
++                "AREAL_MATH_VERIFY_SOFT_TIMEOUT", ""
++            ) not in ("1", "true", "True")
++            if use_process:
++                try:
++                    pool = _get_verify_pool()
++                    future = pool.submit(
++                        _verify_impl_standalone,
++                        response,
++                        ground_truth,
++                        self.try_extract_without_anchor,
++                        self.precision,
++                    )
++                    try:
++                        return future.result(timeout=self.timeout)
++                    except concurrent.futures.TimeoutError:
++                        future.cancel()
++                        _VERIFY_TIMEOUT_COUNT += 1
++                        logger.warning(
++                            f"Timeout ({self.timeout}s) in MathVerifyWorker.verify for "
++                            f"response={response!r} and ground_truth={ground_truth!r}",
++                        )
++                        return 0.0
++                except ValueError as e:
++                    # e.g. max_tasks_per_child + fork; fall through to soft timeout
++                    logger.warning(
++                        "ProcessPool verify unavailable (%s); using soft timeout", e
++                    )
++
++            # Soft timeout fallback (thread may continue after deadline).
++            # Preferred inside shared FS workers (already process-isolated).
+             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                 future = executor.submit(self._verify_impl, response, ground_truth)
+                 return future.result(timeout=self.timeout)
+         except concurrent.futures.TimeoutError:
++            _VERIFY_TIMEOUT_COUNT += 1
+             logger.warning(
+                 f"Timeout ({self.timeout}s) in MathVerifyWorker.verify for "
+                 f"response={response!r} and ground_truth={ground_truth!r}",
+@@ -104,6 +194,7 @@ def get_math_verify_worker() -> MathVerifyWorker:
+ __all__ = [
+     "MathVerifyWorker",
+     "get_math_verify_worker",
++    "get_verify_timeout_count",
+     "gsm8k_reward_fn",
+     "geometry3k_reward_fn",
+     "clevr_count_70k_reward_fn",
+diff --git a/areal/trainer/ppo/actor.py b/areal/trainer/ppo/actor.py
+index 0da0455..04b385a 100644
+--- a/areal/trainer/ppo/actor.py
++++ b/areal/trainer/ppo/actor.py
+@@ -576,6 +576,10 @@ def grpo_loss_fn(
+         dual_clip_ratio=stat["dual_clip_mask"].float(),
+         denominator="n_valid_tokens",
+     )
++    # Explicit scalar aliases for Phase2 compare reports / repro-todo.
++    _pg = stat["loss"]
++    if isinstance(_pg, torch.Tensor) and _pg.numel() > 0:
++        stats_tracker.scalar(pg_loss=float(_pg.detach().float().mean().item()))
+     if "behave_imp_weight" in stat:
+         stats_tracker.denominator(unclipped_behave_tokens=stat["behave_mask"])
+         stats_tracker.stat(
+@@ -584,7 +588,11 @@ def grpo_loss_fn(
+             denominator="unclipped_behave_tokens",
+         )
+     if "filtered_fraction" in stat:
+-        stats_tracker.scalar(rs_filtered_fraction=stat["filtered_fraction"])
++        _mask_ratio = float(stat["filtered_fraction"])
++        stats_tracker.scalar(
++            rs_filtered_fraction=_mask_ratio,
++            **{"dis/mask_ratio": _mask_ratio},
++        )
+ 
+     if vocab_min_logits is not None and vocab_max_logits is not None:
+         stats_tracker.stat(
+diff --git a/areal/trainer/ppo/critic.py b/areal/trainer/ppo/critic.py
+index 05f83c7..121f439 100644
+--- a/areal/trainer/ppo/critic.py
++++ b/areal/trainer/ppo/critic.py
+@@ -62,16 +62,17 @@ class PPOCritic:
+             data,
+             mb_spec=MicroBatchSpec(n_mbs=self.config.ppo_n_minibatches),
+         )
+-        for mb in mb_inputs.mbs:
+-            train_stat = self.engine.train_batch(
+-                mb,
+-                loss_fn=functools.partial(
+-                    ppo_loss_fn,
+-                    eps_clip=self.config.eps_clip,
+-                ),
+-                loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
+-            )
+-            stats_tracker.scalar(**train_stat)
++        with stats_tracker.scope("update"):
++            for mb in mb_inputs.mbs:
++                train_stat = self.engine.train_batch(
++                    mb,
++                    loss_fn=functools.partial(
++                        ppo_loss_fn,
++                        eps_clip=self.config.eps_clip,
++                    ),
++                    loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
++                )
++                stats_tracker.scalar(**train_stat)
+ 
+ 
+ class PPOCriticController(TrainController):
+@@ -137,6 +138,9 @@ def ppo_loss_fn(
+         clip_ratio=stat["clip_mask"].float(),
+         denominator="n_valid_tokens",
+     )
++    _vl = stat["loss"]
++    if isinstance(_vl, torch.Tensor) and _vl.numel() > 0:
++        stats_tracker.scalar(value_loss=float(_vl.detach().float().mean().item()))
+ 
+     clip_mask = stat["clip_mask"]
+     clipped_new_value = torch.where(clip_mask, value.detach(), 0.0)
+diff --git a/areal/trainer/rl_trainer.py b/areal/trainer/rl_trainer.py
+index ef89734..0294e9f 100644
+--- a/areal/trainer/rl_trainer.py
++++ b/areal/trainer/rl_trainer.py
+@@ -310,7 +310,13 @@ class PPOTrainer:
+         )
+ 
+         self.eval_rollout = None
+-        if not self._online_mode:
++        # Skip eval rollout when there is no validation set — avoids a second
++        # proxy fleet that is unused and can stall single-controller startups.
++        if (
++            not self._online_mode
++            and config.valid_dataset is not None
++            and valid_dataset is not None
++        ):
+             self.eval_rollout = self._init_rollout(
+                 config.rollout, is_eval=True, lora_path=initial_lora_path
+             )
+@@ -756,7 +762,10 @@ class PPOTrainer:
+                         args={"global_step": global_step},
+                     ),
+                 ):
+-                    self.critic.ppo_update(adv_batch)
++                    # SAO: faster critic updates (K>1). Default 1 preserves stock AReaL.
++                    critic_k = max(1, int(os.environ.get("SAO_CRITIC_K", "1")))
++                    for _ in range(critic_k):
++                        self.critic.ppo_update(adv_batch)
+                     self.critic.step_lr_scheduler()
+                     self.critic.get_device_stats().log("ppo critic update")
+                 if self._should_offload_critic:
+@@ -1185,6 +1194,7 @@ class PPOTrainer:
+             global_step,
+             tokenizer=self.tokenizer,
+             processor=self.processor,
++            name="actor",
+         )
+         if self.critic is not None:
+             self.saver.save(
+@@ -1282,6 +1292,8 @@ class PPOTrainer:
+         # Upload statistics to the logger (e.g., wandb)
+         stats = self.actor.export_stats()
+         stats.update(self.rollout.export_stats())
++        if self.critic is not None:
++            stats.update(self.critic.export_stats())
+         if self.eval_rollout is not None:
+             stats.update(self.eval_rollout.export_stats())
+         self.stats_logger.commit(epoch, epoch_step, global_step, stats)
+diff --git a/areal/utils/data.py b/areal/utils/data.py
+index 1560742..26747f3 100644
+--- a/areal/utils/data.py
++++ b/areal/utils/data.py
+@@ -4,6 +4,7 @@
+ # Copyright (c) 2023, Tri Dao.
+ 
+ import copy
++from collections import deque
+ from collections.abc import Callable, Iterator, Sequence
+ from dataclasses import dataclass
+ from typing import Any, NamedTuple
+@@ -1386,6 +1387,7 @@ class Normalization:
+     Supports independent specification of normalization level for mean and std:
+     - "batch": normalize across entire batch (with optional all_reduce in distributed setting)
+     - "group": normalize within fixed-size groups
++    - "running": subtract sliding-window mean of recent batch means (baseline)
+     - None: no centering or no std scaling
+     """
+ 
+@@ -1396,6 +1398,8 @@ class Normalization:
+         self.std_unbiased = config.std_unbiased
+         self.group_size = config.group_size
+         self.eps = config.eps
++        self.running_window = getattr(config, "running_window", 128)
++        self._running_means: deque[float] = deque(maxlen=self.running_window)
+ 
+     def _build_group_slices(
+         self, bs: int, group_sizes: list[int] | None
+@@ -1484,6 +1488,23 @@ class Normalization:
+                         reduce_group=None,
+                     )
+                 mean[s] = group_mean.expand_as(xx)
++        elif self.mean_level == "running":
++            batch_mean = self._compute_mean(
++                x,
++                loss_mask,
++                high_precision=high_precision,
++                leave_one_out=False,
++                all_reduce=True,
++                reduce_group=reduce_group,
++            )
++            # Scalar batch mean → sliding window; use prior window as baseline.
++            bm = float(batch_mean.detach().float().reshape(-1)[0].item())
++            if len(self._running_means) == 0:
++                baseline = bm
++            else:
++                baseline = sum(self._running_means) / len(self._running_means)
++            self._running_means.append(bm)
++            mean = torch.full_like(x, baseline)
+         else:  # mean_level == "none"
+             mean = torch.zeros_like(x)
+ 
+diff --git a/areal/utils/recover.py b/areal/utils/recover.py
+index 9af81b7..18c0701 100644
+--- a/areal/utils/recover.py
++++ b/areal/utils/recover.py
+@@ -309,8 +309,22 @@ class RecoverHandler:
+             stats_logger.load_state_dict(recover_info.stats_logger_info)
+             dataloader.load_state_dict(recover_info.dataloader_info)
+ 
+-            for name, engine_ in normalized_engine.items():
+-                self._load_checkpoint(engine_, name=name)
++            # SAO_RECOVER_STEP_ONLY=1: keep step/stats/dataloader counters but skip
++            # dcp load (e.g. topo changed d26→d16; weights come from actor.path HF).
++            step_only = os.environ.get("SAO_RECOVER_STEP_ONLY", "").strip() in (
++                "1",
++                "true",
++                "True",
++                "yes",
++            )
++            if step_only:
++                logger.warning(
++                    "SAO_RECOVER_STEP_ONLY: skipping recover dcp load; "
++                    "using actor.path HF weights and recover step counters only."
++                )
++            else:
++                for name, engine_ in normalized_engine.items():
++                    self._load_checkpoint(engine_, name=name)
+             global_step = recover_info.last_step_info.global_step
+ 
+             if inference_engine is not None:
+@@ -411,6 +425,17 @@ def check_if_auto_recover(config: RecoverConfig) -> bool:
+             logger.warning(msg)
+             return False
+ 
++        step_only = os.environ.get("SAO_RECOVER_STEP_ONLY", "").strip() in (
++            "1",
++            "true",
++            "True",
++            "yes",
++        )
++        if step_only:
++            logger.warning(
++                "SAO_RECOVER_STEP_ONLY: treating recover_info as valid without dcp."
++            )
++            return True
+         save_root = Saver.get_save_root(experiment_name, trial_name, fileroot)
+         for name in os.listdir(save_root):
+             if not os.path.isdir(os.path.join(save_root, name)):
+diff --git a/areal/utils/stats_logger.py b/areal/utils/stats_logger.py
+index 220e6d3..5091b36 100644
+--- a/areal/utils/stats_logger.py
++++ b/areal/utils/stats_logger.py
+@@ -7,10 +7,14 @@ from dataclasses import asdict
+ 
+ import swanlab
+ import torch.distributed as dist
+-import trackio
+ import wandb
+ from tensorboardX import SummaryWriter
+ 
++try:
++    import trackio
++except ImportError:
++    trackio = None
++
+ from areal.api import FinetuneSpec
+ from areal.api.cli_args import BaseExperimentConfig, StatsLoggerConfig
+ from areal.utils import logging
+@@ -98,6 +102,10 @@ class StatsLogger:
+         self._trackio_enabled = False
+         trackio_config = self.config.trackio
+         if trackio_config.mode != "disabled":
++            if trackio is None:
++                raise ImportError(
++                    "Trackio logging is enabled, but trackio dependencies are unavailable"
++                )
+             trackio.init(
+                 project=trackio_config.project or self.config.experiment_name,
+                 name=trackio_config.name or self.config.trial_name,
+diff --git a/areal/workflow/rlvr.py b/areal/workflow/rlvr.py
+index aa8e28a..85be247 100644
+--- a/areal/workflow/rlvr.py
++++ b/areal/workflow/rlvr.py
+@@ -9,13 +9,13 @@ from transformers import PreTrainedTokenizerFast
+ 
+ from areal import workflow_context
+ from areal.api import (
+-    AsyncRewardWrapper,
+     InferenceEngine,
+     ModelRequest,
+     ModelResponse,
+     RolloutWorkflow,
+ )
+-from areal.api.cli_args import GenerationHyperparameters
++from areal.api.cli_args import GenerationHyperparameters, RewardConfig
++from areal.api.reward_api import build_async_reward_executor
+ from areal.utils import logging, stats_tracker
+ from areal.utils.dynamic_import import import_from_string
+ from areal.utils.hf_utils import apply_chat_template
+@@ -59,8 +59,10 @@ class RLVRWorkflow(RolloutWorkflow):
+         | str = default_get_input_ids_fn,
+         data_extract_prompt_fn: Callable[[dict[str, Any]], Any]
+         | str = default_data_extract_prompt_fn,
++        reward_config: RewardConfig | None = None,
+     ):
+         self.reward_fn = reward_fn
++        self.reward_config = reward_config
+         self.tokenizer = tokenizer
+         if isinstance(self.tokenizer, str):
+             from areal.utils.hf_utils import load_hf_tokenizer
+@@ -69,8 +71,25 @@ class RLVRWorkflow(RolloutWorkflow):
+             self.tokenizer = tokenizer
+         self.gconfig = gconfig.new_with_stop_and_pad_token_ids(self.tokenizer)
+         self.enable_thinking = enable_thinking
+-        if not isinstance(reward_fn, str):
+-            self.async_reward_fn = AsyncRewardWrapper(reward_fn)
++        self._reward_fn_path: str | None = (
++            reward_fn if isinstance(reward_fn, str) else None
++        )
++        backend = (
++            getattr(reward_config, "backend", "local") if reward_config else "local"
++        )
++        if backend == "fs_shard":
++            if not isinstance(reward_fn, str):
++                raise TypeError(
++                    "RLVRWorkflow with reward.backend=fs_shard requires "
++                    "reward_fn as an import path string"
++                )
++            self.async_reward_fn = build_async_reward_executor(
++                reward_fn, reward_config
++            )
++        elif not isinstance(reward_fn, str):
++            self.async_reward_fn = build_async_reward_executor(
++                reward_fn, reward_config
++            )
+         # Support string paths for get_input_ids_fn
+         if isinstance(get_input_ids_fn, str):
+             get_input_ids_fn = import_from_string(get_input_ids_fn)
+@@ -87,16 +106,7 @@ class RLVRWorkflow(RolloutWorkflow):
+         prompt_str: str,
+         task_data: dict[str, Any],
+     ) -> float:
+-        """Decode completion and compute reward.
+-
+-        Traces reward phase execution for SessionTracer. Decodes output tokens
+-        to string, calls async reward function, and logs metric to stats tracker.
+-
+-        Returns
+-        -------
+-        float
+-            Reward value.
+-        """
++        """Decode completion and compute reward."""
+         completions_str = self.tokenizer.decode(resp.output_tokens)
+         reward = await self.async_reward_fn(
+             prompt_str,
+@@ -116,17 +126,7 @@ class RLVRWorkflow(RolloutWorkflow):
+         prompt_str: str,
+         task_data: dict[str, Any],
+     ) -> tuple[ModelResponse, float]:
+-        """Generate one sample and compute its reward.
+-
+-        Registers a new session for this sample, calls engine.agenerate,
+-        computes reward, and logs metrics. SessionTracer automatically
+-        tracks generate and reward phases via @trace_session decorators.
+-
+-        Returns
+-        -------
+-        tuple[ModelResponse, float]
+-            Model response and reward value.
+-        """
++        """Generate one sample and compute its reward."""
+         async with atrace_session_phase("generate"):
+             resp = await engine.agenerate(req)
+ 
+@@ -139,10 +139,12 @@ class RLVRWorkflow(RolloutWorkflow):
+     async def arun_episode(
+         self, engine: InferenceEngine, data: dict[str, Any]
+     ) -> dict[str, torch.Tensor]:
+-        # NOTE: load reward function dynamically if given as string
+-        if isinstance(self.reward_fn, str):
+-            self.reward_fn = import_from_string(self.reward_fn)
+-            self.async_reward_fn = AsyncRewardWrapper(self.reward_fn)
++        # Local backend: load reward function dynamically if given as string.
++        # shared FS backend already constructed the client in __init__.
++        if not hasattr(self, "async_reward_fn"):
++            self.async_reward_fn = build_async_reward_executor(
++                self.reward_fn, self.reward_config
++            )
+ 
+         input_ids = self.get_input_ids_fn(
+             self.data_extract_prompt_fn(data),
+@@ -158,10 +160,8 @@ class RLVRWorkflow(RolloutWorkflow):
+ 
+         prompt_str = self.tokenizer.decode(input_ids)
+ 
+-        # Generate single response and compute reward
+         resp, reward = await self._collect_samples(engine, req, prompt_str, data)
+ 
+-        # Build result tensor dict with batch dim 1
+         seq = resp.input_tokens + resp.output_tokens
+         logprobs = [0.0] * resp.input_len + resp.output_logprobs
+         loss_mask = [0] * resp.input_len + [1] * resp.output_len
+diff --git a/areal/reward/simple_answer.py b/areal/reward/simple_answer.py
+new file mode 100644
+index 0000000..781859d
+--- /dev/null
++++ b/areal/reward/simple_answer.py
+@@ -0,0 +1,10 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Lightweight reward fn for shared FS CPU smoke (no math_verify)."""
++
++
++def simple_answer_reward_fn(
++    prompt, completions, prompt_ids=None, completion_ids=None, answer=None, **kwargs
++) -> float:
++    if answer is None:
++        return 0.0
++    return 1.0 if str(answer) in str(completions) else 0.0
+diff --git a/areal/reward/fs_client.py b/areal/reward/fs_client.py
+new file mode 100644
+index 0000000..679eec4
+--- /dev/null
++++ b/areal/reward/fs_client.py
+@@ -0,0 +1,205 @@
++# SPDX-License-Identifier: Apache-2.0
++"""shared FS sharded reward client: submit task files and poll results."""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import time
++from pathlib import Path
++from typing import Any
++
++from areal.reward.fs_protocol import (
++    atomic_write_json,
++    build_task,
++    inbox_path,
++    json_safe,
++    new_task_id,
++    outbox_path,
++    read_manifest,
++    stable_shard,
++    status_path,
++    try_unlink,
++)
++from areal.utils import logging
++
++logger = logging.getLogger("FSRewardClient")
++
++
++class RewardInfraError(RuntimeError):
++    """Infrastructure failure for shared FS reward (not a semantic score=0)."""
++
++
++class FSRewardClient:
++    """Async reward executor that offloads verify to remote shared FS workers.
++
++    Does **not** create a local ProcessPool. Call signature matches
++    ``AsyncRewardWrapper``: ``await client(prompt, completions, ...)``.
++    """
++
++    def __init__(
++        self,
++        reward_fn: str,
++        *,
++        root: str | Path,
++        shard_count: int = 2,
++        timeout_seconds: float = 30.0,
++        poll_interval_ms: float = 50.0,
++        on_error: str = "raise",
++        heartbeat_stale_seconds: float = 15.0,
++        worker_hosts: list[str] | None = None,
++    ):
++        if not isinstance(reward_fn, str) or not reward_fn:
++            raise TypeError(
++                "FSRewardClient requires reward_fn as import path string, "
++                f"got {type(reward_fn)!r}"
++            )
++        if on_error not in ("raise", "zero"):
++            raise ValueError(f"on_error must be 'raise' or 'zero', got {on_error!r}")
++        self.reward_fn = reward_fn
++        self.root = Path(root)
++        self.shard_count = shard_count
++        self.timeout_seconds = timeout_seconds
++        self.poll_interval = poll_interval_ms / 1000.0
++        self.on_error = on_error
++        self.heartbeat_stale_seconds = heartbeat_stale_seconds
++        self.worker_hosts = worker_hosts or []
++        self._manifest_checked = False
++        self.stats = {
++            "submitted": 0,
++            "completed": 0,
++            "infra_error": 0,
++            "semantic_zero": 0,
++            "queue_wait_ms_sum": 0.0,
++            "total_ms_sum": 0.0,
++        }
++
++    def _ensure_manifest(self) -> None:
++        if self._manifest_checked:
++            return
++        manifest_path = self.root / "manifest.json"
++        if not manifest_path.exists():
++            raise RewardInfraError(
++                f"shared FS reward manifest missing at {manifest_path}; "
++                "start reward workers before training"
++            )
++        manifest = read_manifest(self.root)
++        if int(manifest.get("shard_count", 0)) != self.shard_count:
++            raise RewardInfraError(
++                f"shard_count mismatch: client={self.shard_count} "
++                f"manifest={manifest.get('shard_count')}"
++            )
++        self._manifest_checked = True
++
++    def _check_heartbeats(self) -> None:
++        if not self.worker_hosts:
++            return
++        now = time.time()
++        for host in self.worker_hosts:
++            path = status_path(self.root, host)
++            if not path.exists():
++                raise RewardInfraError(f"reward worker heartbeat missing: {host}")
++            try:
++                with path.open("r", encoding="utf-8") as f:
++                    st = json.load(f)
++            except (OSError, json.JSONDecodeError) as e:
++                raise RewardInfraError(f"bad heartbeat for {host}: {e}") from e
++            hb = float(st.get("heartbeat_at", 0))
++            if now - hb > self.heartbeat_stale_seconds:
++                raise RewardInfraError(
++                    f"reward worker heartbeat stale: {host} "
++                    f"age={now - hb:.1f}s > {self.heartbeat_stale_seconds}s"
++                )
++            if st.get("ready") is False:
++                raise RewardInfraError(f"reward worker not ready: {host}")
++
++    def _handle_infra(self, msg: str) -> float:
++        self.stats["infra_error"] += 1
++        logger.error("shared FS reward infra error: %s", msg)
++        if self.on_error == "zero":
++            return 0.0
++        raise RewardInfraError(msg)
++
++    async def __call__(self, *args: Any, **kwargs: Any) -> float:
++        t0 = time.perf_counter()
++        try:
++            self._ensure_manifest()
++            self._check_heartbeats()
++            safe_args = json_safe(list(args))
++            # Strip non-JSON / oversized fields commonly present in task_data
++            clean_kwargs = {
++                k: v
++                for k, v in kwargs.items()
++                if k
++                not in (
++                    "messages",
++                    "prompt_ids",
++                    "completion_ids",
++                    "input_ids",
++                    "output_ids",
++                )
++            }
++            # Keep answer and other scalar fields; drop nested tensors etc.
++            safe_kwargs = {}
++            for k, v in clean_kwargs.items():
++                try:
++                    safe_kwargs[k] = json_safe(v)
++                except TypeError:
++                    continue
++            # Positional: prompt, completions, prompt_ids, completion_ids
++            # Workers only need completions + answer for gsm8k; keep args truncated
++            submit_args: list[Any] = []
++            if len(safe_args) >= 2:
++                submit_args = [safe_args[0], safe_args[1], [], []]
++            else:
++                submit_args = safe_args
++
++            task_id = new_task_id()
++            shard = stable_shard(task_id, self.shard_count)
++            task = build_task(
++                task_id=task_id,
++                reward_fn=self.reward_fn,
++                args=submit_args,
++                kwargs=safe_kwargs,
++            )
++            in_path = inbox_path(self.root, shard, task_id)
++            out_path = outbox_path(self.root, task_id)
++            atomic_write_json(in_path, task)
++            self.stats["submitted"] += 1
++        except RewardInfraError as e:
++            return self._handle_infra(str(e))
++        except Exception as e:
++            return self._handle_infra(f"submit failed: {e}")
++
++        deadline = t0 + self.timeout_seconds
++        while True:
++            if out_path.exists():
++                try:
++                    with out_path.open("r", encoding="utf-8") as f:
++                        result = json.load(f)
++                except (OSError, json.JSONDecodeError) as e:
++                    try_unlink(out_path)
++                    return self._handle_infra(f"bad result file {out_path}: {e}")
++                try_unlink(out_path)
++                status = result.get("status")
++                if status == "ok":
++                    score = float(result.get("score", 0.0))
++                    self.stats["completed"] += 1
++                    if score == 0.0:
++                        self.stats["semantic_zero"] += 1
++                    qw = result.get("queue_wait_ms")
++                    if qw is not None:
++                        self.stats["queue_wait_ms_sum"] += float(qw)
++                    self.stats["total_ms_sum"] += (time.perf_counter() - t0) * 1000.0
++                    return score
++                err = result.get("error") or f"status={status}"
++                return self._handle_infra(f"task {task_id} failed: {err}")
++
++            if time.perf_counter() >= deadline:
++                try_unlink(in_path)
++                try_unlink(out_path)
++                return self._handle_infra(
++                    f"timeout waiting outbox for {task_id} "
++                    f"after {self.timeout_seconds}s"
++                )
++            await asyncio.sleep(self.poll_interval)
+diff --git a/areal/reward/fs_protocol.py b/areal/reward/fs_protocol.py
+new file mode 100644
+index 0000000..d58f41e
+--- /dev/null
++++ b/areal/reward/fs_protocol.py
+@@ -0,0 +1,213 @@
++# SPDX-License-Identifier: Apache-2.0
++"""shared FS sharded reward file protocol (inbox/outbox, no RPC)."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import time
++import uuid
++from pathlib import Path
++from typing import Any
++
++SCHEMA_VERSION = 1
++DEFAULT_ROOT_PREFIX = "${REWARD_ROOT}"
++
++
++def stable_shard(task_id: str, shard_count: int) -> int:
++    if shard_count <= 0:
++        raise ValueError(f"shard_count must be > 0, got {shard_count}")
++    digest = hashlib.blake2b(task_id.encode("utf-8"), digest_size=8).digest()
++    return int.from_bytes(digest, "big") % shard_count
++
++
++def new_task_id() -> str:
++    return uuid.uuid4().hex
++
++
++def run_root(
++    root: str,
++    experiment_name: str | None = None,
++    trial_name: str | None = None,
++    run_id: str | None = None,
++) -> Path:
++    """Resolve absolute run root.
++
++    If ``root`` already points at a concrete run directory (contains
++    ``manifest.json`` or ends with a run_id), return it as-is. Otherwise
++    append ``experiment/trial/run_id`` under the given prefix.
++    """
++    p = Path(root)
++    if (p / "manifest.json").exists() or (p / "inbox").exists():
++        return p
++    if run_id and experiment_name and trial_name:
++        return p / experiment_name / trial_name / run_id
++    return p
++
++
++def ensure_run_dirs(root: Path, shard_count: int) -> None:
++    root.mkdir(parents=True, exist_ok=True)
++    (root / "inbox").mkdir(exist_ok=True)
++    (root / "outbox").mkdir(exist_ok=True)
++    (root / "status").mkdir(exist_ok=True)
++    (root / "ctl").mkdir(exist_ok=True)
++    for shard in range(shard_count):
++        (root / "inbox" / str(shard)).mkdir(exist_ok=True)
++
++
++def write_manifest(root: Path, payload: dict[str, Any]) -> Path:
++    ensure_run_dirs(root, int(payload.get("shard_count", 2)))
++    data = {
++        "schema_version": SCHEMA_VERSION,
++        "created_at": time.time(),
++        **payload,
++    }
++    path = root / "manifest.json"
++    atomic_write_json(path, data)
++    return path
++
++
++def read_manifest(root: Path) -> dict[str, Any]:
++    path = root / "manifest.json"
++    with path.open("r", encoding="utf-8") as f:
++        return json.load(f)
++
++
++def inbox_path(root: Path, shard: int, task_id: str) -> Path:
++    return root / "inbox" / str(shard) / f"{task_id}.json"
++
++
++def outbox_path(root: Path, task_id: str) -> Path:
++    return root / "outbox" / f"{task_id}.json"
++
++
++def status_path(root: Path, host: str) -> Path:
++    return root / "status" / f"{host}.json"
++
++
++def atomic_write_bytes(path: Path, data: bytes) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
++    try:
++        with tmp.open("wb") as f:
++            f.write(data)
++            f.flush()
++            os.fsync(f.fileno())
++        os.replace(tmp, path)
++    finally:
++        if tmp.exists():
++            try:
++                tmp.unlink()
++            except OSError:
++                pass
++
++
++def atomic_write_text(path: Path, text: str) -> None:
++    atomic_write_bytes(path, text.encode("utf-8"))
++
++
++def atomic_write_json(path: Path, obj: dict[str, Any]) -> None:
++    atomic_write_text(path, json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
++
++
++def build_task(
++    *,
++    task_id: str,
++    reward_fn: str,
++    args: list[Any],
++    kwargs: dict[str, Any],
++) -> dict[str, Any]:
++    return {
++        "schema_version": SCHEMA_VERSION,
++        "task_id": task_id,
++        "reward_fn": reward_fn,
++        "args": args,
++        "kwargs": kwargs,
++        "created_at": time.time(),
++    }
++
++
++def build_result(
++    *,
++    task_id: str,
++    status: str,
++    score: float | None = None,
++    error: str | None = None,
++    queue_wait_ms: float | None = None,
++    verify_ms: float | None = None,
++    total_ms: float | None = None,
++    worker_host: str | None = None,
++    shard: int | None = None,
++) -> dict[str, Any]:
++    return {
++        "schema_version": SCHEMA_VERSION,
++        "task_id": task_id,
++        "status": status,  # ok | error | timeout
++        "score": score,
++        "error": error,
++        "queue_wait_ms": queue_wait_ms,
++        "verify_ms": verify_ms,
++        "total_ms": total_ms,
++        "worker_host": worker_host,
++        "shard": shard,
++        "finished_at": time.time(),
++    }
++
++
++def json_safe(obj: Any) -> Any:
++    """Ensure payload is JSON-serializable; raise TypeError otherwise."""
++    if obj is None or isinstance(obj, (bool, int, float, str)):
++        return obj
++    if isinstance(obj, (list, tuple)):
++        return [json_safe(x) for x in obj]
++    if isinstance(obj, dict):
++        out = {}
++        for k, v in obj.items():
++            if not isinstance(k, str):
++                raise TypeError(f"non-string kwargs key: {k!r}")
++            out[k] = json_safe(v)
++        return out
++    raise TypeError(f"not JSON-serializable: {type(obj).__name__}")
++
++
++def try_unlink(path: Path) -> None:
++    try:
++        path.unlink(missing_ok=True)
++    except OSError:
++        pass
++
++
++def cleanup_orphans(
++    root: Path,
++    *,
++    task_ttl_seconds: float = 600.0,
++    now: float | None = None,
++) -> dict[str, int]:
++    """Remove stale inbox/outbox files older than TTL. Hot path should not call this."""
++    now = time.time() if now is None else now
++    removed = {"inbox": 0, "outbox": 0}
++    inbox = root / "inbox"
++    if inbox.exists():
++        for shard_dir in inbox.iterdir():
++            if not shard_dir.is_dir():
++                continue
++            for path in shard_dir.glob("*.json"):
++                try:
++                    age = now - path.stat().st_mtime
++                except OSError:
++                    continue
++                if age > task_ttl_seconds:
++                    try_unlink(path)
++                    removed["inbox"] += 1
++    outbox = root / "outbox"
++    if outbox.exists():
++        for path in outbox.glob("*.json"):
++            try:
++                age = now - path.stat().st_mtime
++            except OSError:
++                continue
++            if age > task_ttl_seconds:
++                try_unlink(path)
++                removed["outbox"] += 1
++    return removed
+diff --git a/areal/reward/fs_worker.py b/areal/reward/fs_worker.py
+new file mode 100644
+index 0000000..9fb21ed
+--- /dev/null
++++ b/areal/reward/fs_worker.py
+@@ -0,0 +1,377 @@
++# SPDX-License-Identifier: Apache-2.0
++"""shared FS sharded reward worker: consume one inbox shard with a bounded process pool."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import resource
++import signal
++import sys
++import threading
++import time
++from collections import deque
++from concurrent.futures import ProcessPoolExecutor, Future
++from pathlib import Path
++from typing import Any
++
++from areal.reward.fs_protocol import (
++    atomic_write_json,
++    build_result,
++    outbox_path,
++    status_path,
++    try_unlink,
++)
++from areal.utils.dynamic_import import import_from_string
++
++# Module-level cache inside pool workers
++_FN_CACHE: dict[str, Any] = {}
++
++
++def _rss_gib() -> float:
++    try:
++        # ru_maxrss: Linux KiB, macOS bytes
++        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
++        if sys.platform == "darwin":
++            return rss / (1024**3)
++        return rss / (1024**2) / 1024.0
++    except Exception:
++        return 0.0
++
++
++def _load_reward_fn(path: str):
++    fn = _FN_CACHE.get(path)
++    if fn is None:
++        fn = import_from_string(path)
++        _FN_CACHE[path] = fn
++    return fn
++
++
++def _run_reward_task(task: dict[str, Any]) -> dict[str, Any]:
++    """Executed inside ProcessPool worker process."""
++    t0 = time.perf_counter()
++    task_id = task["task_id"]
++    try:
++        fn = _load_reward_fn(task["reward_fn"])
++        args = task.get("args") or []
++        kwargs = task.get("kwargs") or {}
++        score = float(fn(*args, **kwargs))
++        verify_ms = (time.perf_counter() - t0) * 1000.0
++        return {
++            "task_id": task_id,
++            "status": "ok",
++            "score": score,
++            "error": None,
++            "verify_ms": verify_ms,
++        }
++    except Exception as e:
++        verify_ms = (time.perf_counter() - t0) * 1000.0
++        return {
++            "task_id": task_id,
++            "status": "error",
++            "score": None,
++            "error": f"{type(e).__name__}: {e}",
++            "verify_ms": verify_ms,
++        }
++
++
++class FSRewardWorker:
++    """Coordinator for one shard on one host."""
++
++    def __init__(
++        self,
++        *,
++        root: str | Path,
++        shard: int,
++        host: str,
++        concurrency: int = 48,
++        scan_interval_s: float = 0.05,
++        max_tasks_per_child: int = 128,
++        task_ttl_seconds: float = 600.0,
++    ):
++        self.root = Path(root)
++        self.shard = shard
++        self.host = host
++        self.concurrency = concurrency
++        self.scan_interval_s = scan_interval_s
++        self.max_tasks_per_child = max_tasks_per_child
++        self.task_ttl_seconds = task_ttl_seconds
++        self.inbox_dir = self.root / "inbox" / str(shard)
++        self._stop = False
++        self._inflight: dict[Future, dict[str, Any]] = {}
++        self._seen: set[str] = set()
++        self._completed = 0
++        self._errors = 0
++        self._semantic_zero = 0
++        self._verify_timeout_n = 0
++        self._q_wait_samples: deque[float] = deque(maxlen=512)
++        self._verify_samples: deque[float] = deque(maxlen=512)
++        self._completed_window: deque[float] = deque()
++        self._pool: ProcessPoolExecutor | None = None
++        self._started_at = time.time()
++
++    def request_stop(self, *_args) -> None:
++        self._stop = True
++
++    def _percentile(self, samples: deque[float], p: float) -> float | None:
++        if not samples:
++            return None
++        arr = sorted(samples)
++        idx = min(len(arr) - 1, max(0, int(round((p / 100.0) * (len(arr) - 1)))))
++        return arr[idx]
++
++    def _write_status(self, ready: bool = True) -> None:
++        now = time.time()
++        # QPS over last ~5s
++        while self._completed_window and now - self._completed_window[0] > 5.0:
++            self._completed_window.popleft()
++        qps = len(self._completed_window) / 5.0
++        pending_files = 0
++        if self.inbox_dir.exists():
++            try:
++                pending_files = sum(1 for _ in self.inbox_dir.glob("*.json"))
++            except OSError:
++                pending_files = -1
++        payload = {
++            "host": self.host,
++            "shard": self.shard,
++            "ready": ready and not self._stop,
++            "heartbeat_at": now,
++            "started_at": self._started_at,
++            "pid": os.getpid(),
++            "concurrency": self.concurrency,
++            "inflight": len(self._inflight),
++            "queue_depth": pending_files,
++            "qps": qps,
++            "completed": self._completed,
++            "errors": self._errors,
++            "semantic_zero": self._semantic_zero,
++            "verify_timeout_n": self._verify_timeout_n,
++            "queue_wait_ms_p50": self._percentile(self._q_wait_samples, 50),
++            "queue_wait_ms_p95": self._percentile(self._q_wait_samples, 95),
++            "verify_ms_p50": self._percentile(self._verify_samples, 50),
++            "verify_ms_p95": self._percentile(self._verify_samples, 95),
++            "rss_gib": _rss_gib(),
++        }
++        atomic_write_json(status_path(self.root, self.host), payload)
++
++    def _ensure_pool(self) -> ProcessPoolExecutor:
++        if self._pool is not None:
++            return self._pool
++        pool_kwargs: dict[str, Any] = {"max_workers": self.concurrency}
++        if sys.version_info >= (3, 11):
++            pool_kwargs["max_tasks_per_child"] = self.max_tasks_per_child
++        self._pool = ProcessPoolExecutor(**pool_kwargs)
++        return self._pool
++
++    def _recreate_pool(self) -> None:
++        if self._pool is not None:
++            try:
++                self._pool.shutdown(wait=False, cancel_futures=True)
++            except Exception:
++                pass
++            self._pool = None
++        self._inflight.clear()
++        self._ensure_pool()
++
++    def _submit_path(self, path: Path) -> None:
++        if len(self._inflight) >= self.concurrency:
++            return
++        try:
++            with path.open("r", encoding="utf-8") as f:
++                task = json.load(f)
++        except (OSError, json.JSONDecodeError) as e:
++            task_id = path.stem
++            result = build_result(
++                task_id=task_id,
++                status="error",
++                error=f"bad_inbox_json: {e}",
++                worker_host=self.host,
++                shard=self.shard,
++            )
++            atomic_write_json(outbox_path(self.root, task_id), result)
++            try_unlink(path)
++            self._errors += 1
++            return
++
++        task_id = task.get("task_id") or path.stem
++        if task_id in self._seen:
++            return
++        created = float(task.get("created_at", time.time()))
++        meta = {
++            "task_id": task_id,
++            "inbox_path": path,
++            "created_at": created,
++            "submit_at_wall": time.time(),
++        }
++        pool = self._ensure_pool()
++        try:
++            fut = pool.submit(_run_reward_task, task)
++        except Exception as e:
++            # BrokenProcessPool etc. — recreate and retry once
++            self._recreate_pool()
++            try:
++                fut = self._ensure_pool().submit(_run_reward_task, task)
++            except Exception as e2:
++                result = build_result(
++                    task_id=task_id,
++                    status="error",
++                    error=f"submit_failed: {type(e2).__name__}: {e2}",
++                    worker_host=self.host,
++                    shard=self.shard,
++                )
++                atomic_write_json(outbox_path(self.root, task_id), result)
++                try_unlink(path)
++                self._errors += 1
++                return
++        self._inflight[fut] = meta
++        self._seen.add(task_id)
++
++    def _drain_done(self) -> None:
++        done = [f for f in list(self._inflight) if f.done()]
++        for fut in done:
++            # After BrokenProcessPool → _recreate_pool(), _inflight is cleared;
++            # never KeyError on a sibling Future that was already wiped.
++            meta = self._inflight.pop(fut, None)
++            if meta is None:
++                continue
++            task_id = meta["task_id"]
++            queue_wait_ms = max(
++                0.0, (meta["submit_at_wall"] - meta["created_at"]) * 1000.0
++            )
++            pool_broke = False
++            try:
++                out = fut.result()
++            except Exception as e:
++                out = {
++                    "task_id": task_id,
++                    "status": "error",
++                    "score": None,
++                    "error": f"{type(e).__name__}: {e}",
++                    "verify_ms": None,
++                }
++                ename = type(e).__name__
++                if ename == "BrokenProcessPool" or "BrokenProcessPool" in str(e):
++                    pool_broke = True
++                    self._recreate_pool()
++            status = out.get("status", "error")
++            score = out.get("score")
++            verify_ms = out.get("verify_ms")
++            if verify_ms is not None:
++                self._verify_samples.append(float(verify_ms))
++            self._q_wait_samples.append(float(queue_wait_ms))
++            total_ms = queue_wait_ms + (float(verify_ms) if verify_ms else 0.0)
++            result = build_result(
++                task_id=task_id,
++                status=status,
++                score=float(score) if score is not None else None,
++                error=out.get("error"),
++                queue_wait_ms=queue_wait_ms,
++                verify_ms=verify_ms,
++                total_ms=total_ms,
++                worker_host=self.host,
++                shard=self.shard,
++            )
++            atomic_write_json(outbox_path(self.root, task_id), result)
++            try_unlink(meta["inbox_path"])
++            if status == "ok":
++                self._completed += 1
++                self._completed_window.append(time.time())
++                if float(score or 0.0) == 0.0:
++                    self._semantic_zero += 1
++            else:
++                self._errors += 1
++            if len(self._seen) > 50000:
++                self._seen.clear()
++            # Pool was recreated and inflight cleared — stop draining stale Futures.
++            if pool_broke:
++                return
++
++    def run(self) -> None:
++        self.inbox_dir.mkdir(parents=True, exist_ok=True)
++        (self.root / "outbox").mkdir(parents=True, exist_ok=True)
++        (self.root / "status").mkdir(parents=True, exist_ok=True)
++
++        self._ensure_pool()
++
++        # SIGTERM only works in the main thread (production ctl starts main).
++        if threading.current_thread() is threading.main_thread():
++            signal.signal(signal.SIGTERM, self.request_stop)
++            signal.signal(signal.SIGINT, self.request_stop)
++
++        self._write_status(ready=True)
++        last_status = 0.0
++        try:
++            while not self._stop:
++                self._drain_done()
++                if len(self._inflight) < self.concurrency and self.inbox_dir.exists():
++                    try:
++                        paths = sorted(
++                            self.inbox_dir.glob("*.json"),
++                            key=lambda p: p.stat().st_mtime,
++                        )
++                    except OSError:
++                        paths = []
++                    for path in paths:
++                        if self._stop:
++                            break
++                        if len(self._inflight) >= self.concurrency:
++                            break
++                        self._submit_path(path)
++                now = time.time()
++                if now - last_status >= 1.0:
++                    self._write_status(ready=True)
++                    last_status = now
++                time.sleep(self.scan_interval_s)
++
++            grace_deadline = time.time() + 30.0
++            while self._inflight and time.time() < grace_deadline:
++                self._drain_done()
++                time.sleep(0.05)
++            self._write_status(ready=False)
++        finally:
++            if self._pool is not None:
++                self._pool.shutdown(wait=False, cancel_futures=True)
++                self._pool = None
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description="shared FS sharded reward worker")
++    parser.add_argument("--root", required=True, help="Absolute shared FS run root")
++    parser.add_argument("--shard", type=int, required=True)
++    parser.add_argument("--host", required=True, help="Hostname label for status file")
++    parser.add_argument("--concurrency", type=int, default=48)
++    parser.add_argument("--scan-interval-ms", type=float, default=50.0)
++    parser.add_argument("--max-tasks-per-child", type=int, default=128)
++    args = parser.parse_args(argv)
++
++    # Forbid running consumer on head by convention (soft check)
++    host_env = os.environ.get("HOSTNAME", "") or os.environ.get("HOST", "")
++    if "head" in (args.host, host_env):
++        print(
++            "ERROR: reward consumer must not run on head",
++            file=sys.stderr,
++        )
++        return 2
++
++    worker = FSRewardWorker(
++        root=args.root,
++        shard=args.shard,
++        host=args.host,
++        concurrency=args.concurrency,
++        scan_interval_s=args.scan_interval_ms / 1000.0,
++        max_tasks_per_child=args.max_tasks_per_child,
++    )
++    print(
++        f"[reward_worker] host={args.host} shard={args.shard} "
++        f"concurrency={args.concurrency} root={args.root}",
++        flush=True,
++    )
++    worker.run()
++    print("[reward_worker] stopped", flush=True)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/test_fs_sharded_reward.py b/tests/test_fs_sharded_reward.py
+new file mode 100644
+index 0000000..06e31e8
+--- /dev/null
++++ b/tests/test_fs_sharded_reward.py
+@@ -0,0 +1,217 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Unit tests for shared FS sharded reward protocol / client / worker."""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import os
++import signal
++import time
++from concurrent.futures import ProcessPoolExecutor
++from pathlib import Path
++
++import pytest
++
++from areal.api.cli_args import RewardConfig, FSRewardConfig, FSRewardWorkerConfig
++from areal.api.reward_api import AsyncRewardWrapper, build_async_reward_executor
++from areal.reward.fs_client import RewardInfraError, FSRewardClient
++from areal.reward.fs_protocol import (
++    atomic_write_json,
++    build_result,
++    cleanup_orphans,
++    inbox_path,
++    outbox_path,
++    stable_shard,
++    write_manifest,
++)
++from areal.reward.fs_worker import FSRewardWorker
++
++
++def _dummy_reward(prompt, completions, prompt_ids, completion_ids, answer="4", **kw):
++    return 1.0 if str(answer) in str(completions) else 0.0
++
++
++@pytest.fixture(autouse=True)
++def _isolate_executor_state():
++    AsyncRewardWrapper._atexit_shutdown_all()
++    yield
++    AsyncRewardWrapper._atexit_shutdown_all()
++
++
++class TestProtocol:
++    def test_stable_shard_deterministic(self):
++        assert stable_shard("abc", 2) == stable_shard("abc", 2)
++        shards = {stable_shard(f"id{i}", 2) for i in range(200)}
++        assert shards == {0, 1}
++
++    def test_atomic_write_visible(self, tmp_path: Path):
++        p = tmp_path / "x.json"
++        atomic_write_json(p, {"a": 1})
++        assert json.loads(p.read_text()) == {"a": 1}
++
++    def test_cleanup_orphans(self, tmp_path: Path):
++        write_manifest(tmp_path, {"shard_count": 2, "run_id": "t"})
++        old = inbox_path(tmp_path, 0, "oldtask")
++        atomic_write_json(old, {"task_id": "oldtask"})
++        os.utime(old, (time.time() - 1000, time.time() - 1000))
++        fresh = inbox_path(tmp_path, 0, "newtask")
++        atomic_write_json(fresh, {"task_id": "newtask"})
++        removed = cleanup_orphans(tmp_path, task_ttl_seconds=100)
++        assert removed["inbox"] >= 1
++        assert not old.exists()
++        assert fresh.exists()
++
++
++class TestFactoryLocal:
++    @pytest.mark.asyncio
++    async def test_local_default(self):
++        ex = build_async_reward_executor(_dummy_reward, None)
++        assert isinstance(ex, AsyncRewardWrapper)
++        assert await ex("p", "answer is 4", [], [], answer="4") == 1.0
++
++    @pytest.mark.asyncio
++    async def test_local_config(self):
++        cfg = RewardConfig(backend="local", timeout_seconds=5, max_retries=0)
++        ex = build_async_reward_executor(_dummy_reward, cfg)
++        assert await ex("p", "nope", [], [], answer="4") == 0.0
++
++    def test_fs_requires_string(self):
++        cfg = RewardConfig(backend="fs_shard")
++        with pytest.raises(TypeError):
++            build_async_reward_executor(_dummy_reward, cfg)
++
++
++class Testshared FSClientWorker:
++    @pytest.mark.asyncio
++    async def test_end_to_end_two_shards(self, tmp_path: Path):
++        import subprocess
++        import sys
++
++        write_manifest(
++            tmp_path,
++            {
++                "shard_count": 2,
++                "run_id": "ut",
++                "reward_fn": "areal.reward.simple_answer.simple_answer_reward_fn",
++            },
++        )
++        procs = []
++        for shard, host in ((0, "worker-0"), (1, "worker-1")):
++            p = subprocess.Popen(
++                [
++                    sys.executable,
++                    "-m",
++                    "areal.reward.fs_worker",
++                    "--root",
++                    str(tmp_path),
++                    "--shard",
++                    str(shard),
++                    "--host",
++                    host,
++                    "--concurrency",
++                    "2",
++                ],
++                stdout=subprocess.DEVNULL,
++                stderr=subprocess.DEVNULL,
++            )
++            procs.append(p)
++
++        try:
++            deadline = time.time() + 20
++            while time.time() < deadline:
++                ok = True
++                for host in ("worker-0", "worker-1"):
++                    p = tmp_path / "status" / f"{host}.json"
++                    if not p.exists() or not json.loads(p.read_text()).get("ready"):
++                        ok = False
++                        break
++                if ok:
++                    break
++                await asyncio.sleep(0.05)
++            else:
++                raise AssertionError("workers not ready")
++
++            client = FSRewardClient(
++                "areal.reward.simple_answer.simple_answer_reward_fn",
++                root=tmp_path,
++                shard_count=2,
++                timeout_seconds=30,
++                poll_interval_ms=20,
++                on_error="raise",
++                worker_hosts=["worker-0", "worker-1"],
++            )
++
++            scores = await asyncio.gather(
++                *[
++                    client("q", f"The answer is {i}", [], [], answer=str(i))
++                    for i in range(8)
++                ]
++            )
++            assert all(s == 1.0 for s in scores)
++
++            zeros = await asyncio.gather(
++                *[
++                    client("q", "The answer is 0", [], [], answer="99")
++                    for _ in range(4)
++                ]
++            )
++            assert all(z == 0.0 for z in zeros)
++        finally:
++            for p in procs:
++                p.send_signal(signal.SIGTERM)
++            for p in procs:
++                p.wait(timeout=15)
++
++    @pytest.mark.asyncio
++    async def test_timeout_fail_fast(self, tmp_path: Path):
++        write_manifest(tmp_path, {"shard_count": 2, "run_id": "t"})
++        for host in ("worker-0", "worker-1"):
++            atomic_write_json(
++                tmp_path / "status" / f"{host}.json",
++                {"ready": True, "heartbeat_at": time.time(), "host": host},
++            )
++        client = FSRewardClient(
++            "areal.reward.gsm8k.gsm8k_reward_fn",
++            root=tmp_path,
++            shard_count=2,
++            timeout_seconds=0.2,
++            poll_interval_ms=20,
++            on_error="raise",
++            worker_hosts=["worker-0", "worker-1"],
++        )
++        with pytest.raises(RewardInfraError):
++            await client("q", "4", [], [], answer="4")
++
++    @pytest.mark.asyncio
++    async def test_on_error_zero(self, tmp_path: Path):
++        write_manifest(tmp_path, {"shard_count": 2, "run_id": "t"})
++        for host in ("worker-0", "worker-1"):
++            atomic_write_json(
++                tmp_path / "status" / f"{host}.json",
++                {"ready": True, "heartbeat_at": time.time(), "host": host},
++            )
++        client = FSRewardClient(
++            "areal.reward.gsm8k.gsm8k_reward_fn",
++            root=tmp_path,
++            shard_count=2,
++            timeout_seconds=0.15,
++            on_error="zero",
++            worker_hosts=["worker-0", "worker-1"],
++        )
++        assert await client("q", "4", [], [], answer="4") == 0.0
++        assert client.stats["infra_error"] >= 1
++
++    def test_duplicate_task_id_idempotent_result(self, tmp_path: Path):
++        write_manifest(tmp_path, {"shard_count": 1, "run_id": "t"})
++        tid = "sameid"
++        atomic_write_json(
++            outbox_path(tmp_path, tid),
++            build_result(task_id=tid, status="ok", score=1.0),
++        )
++        # second write overwrites atomically — last wins
++        atomic_write_json(
++            outbox_path(tmp_path, tid),
++            build_result(task_id=tid, status="ok", score=1.0),
++        )
++        assert json.loads(outbox_path(tmp_path, tid).read_text())["score"] == 1.0
+diff --git a/tests/test_fs_worker_drain.py b/tests/test_fs_worker_drain.py
+new file mode 100644
+index 0000000..383a570
+--- /dev/null
++++ b/tests/test_fs_worker_drain.py
+@@ -0,0 +1,76 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Unit tests for shared FS reward worker BrokenProcessPool drain fix (issue 20260724)."""
++
++from __future__ import annotations
++
++from concurrent.futures import Future
++from pathlib import Path
++from unittest.mock import MagicMock
++
++import pytest
++
++from areal.reward.fs_worker import FSRewardWorker
++
++
++class _BrokenFut:
++    """Minimal Future-like object that is done and raises BrokenProcessPool."""
++
++    def __init__(self, err: BaseException):
++        self._err = err
++
++    def done(self) -> bool:
++        return True
++
++    def result(self):
++        raise self._err
++
++
++def test_drain_done_broken_pool_does_not_keyerror(tmp_path: Path):
++    # concurrent.futures.process.BrokenProcessPool
++    from concurrent.futures.process import BrokenProcessPool
++
++    w = FSRewardWorker(
++        root=tmp_path,
++        shard=0,
++        host="worker-0",
++        concurrency=4,
++    )
++    (tmp_path / "outbox").mkdir(parents=True, exist_ok=True)
++    (tmp_path / "inbox" / "0").mkdir(parents=True, exist_ok=True)
++
++    inbox_a = tmp_path / "inbox" / "0" / "a.json"
++    inbox_b = tmp_path / "inbox" / "0" / "b.json"
++    inbox_a.write_text("{}")
++    inbox_b.write_text("{}")
++
++    fut1 = _BrokenFut(BrokenProcessPool("pool dead"))
++    fut2 = _BrokenFut(BrokenProcessPool("pool dead"))
++    w._inflight[fut1] = {  # type: ignore[index]
++        "task_id": "a",
++        "inbox_path": inbox_a,
++        "created_at": 1.0,
++        "submit_at_wall": 1.1,
++    }
++    w._inflight[fut2] = {  # type: ignore[index]
++        "task_id": "b",
++        "inbox_path": inbox_b,
++        "created_at": 1.0,
++        "submit_at_wall": 1.1,
++    }
++
++    # Should not raise KeyError; should clear/recreate and return.
++    w._recreate_pool = MagicMock(wraps=w._recreate_pool)  # type: ignore[method-assign]
++    w._drain_done()
++    assert w._recreate_pool.called
++    # After recreate, inflight must be empty (no leftover stale futures).
++    assert w._inflight == {}
++    # First task should have an outbox error written
++    assert (tmp_path / "outbox" / "a.json").exists()
++
++
++def test_drain_done_pop_missing_is_safe(tmp_path: Path):
++    w = FSRewardWorker(root=tmp_path, shard=0, host="worker-0", concurrency=2)
++    (tmp_path / "outbox").mkdir(parents=True, exist_ok=True)
++    # empty inflight — drain is no-op
++    w._drain_done()
++    assert w._inflight == {}
+diff --git a/tests/utils_fs_reward_fn.py b/tests/utils_fs_reward_fn.py
+new file mode 100644
+index 0000000..4a3e026
+--- /dev/null
++++ b/tests/utils_fs_reward_fn.py
+@@ -0,0 +1,10 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Picklable reward fn for shared FS worker unit tests (no math_verify)."""
++
++
++def simple_answer_reward_fn(
++    prompt, completions, prompt_ids=None, completion_ids=None, answer=None, **kwargs
++) -> float:
++    if answer is None:
++        return 0.0
++    return 1.0 if str(answer) in str(completions) else 0.0

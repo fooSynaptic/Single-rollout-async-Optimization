@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 640"
+     font-family="PingFang SC,Microsoft YaHei,Helvetica Neue,Arial,sans-serif">
+
+<defs>
+  <style>
+    .title { font-size: 20px; font-weight: 700; fill: #0f172a; }
+    .subtitle { font-size: 12px; fill: #64748b; }
+    .node-title { font-size: 14px; font-weight: 600; fill: #1e293b; }
+    .node-text { font-size: 12px; fill: #475569; }
+    .node-text-bold { font-size: 12px; font-weight: 600; fill: #1e293b; }
+    .badge-text { font-size: 11px; font-weight: 600; fill: #fff; }
+    .arrow-label { font-size: 11px; font-weight: 600; fill: #334155; }
+    .mono { font-family: Consolas,Menlo,monospace; font-size: 12px; font-weight: 600; }
+    .footnote { font-size: 11px; fill: #64748b; }
+    .chip { font-size: 11px; font-weight: 600; fill: #fff; }
+  </style>
+  <marker id="arrow-teal" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="6" orient="auto-start-reverse">
+    <path d="M0,0 L10,4 L0,8 Z" fill="#0d9488"/>
+  </marker>
+  <marker id="arrow-amber" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="6" orient="auto-start-reverse">
+    <path d="M0,0 L10,4 L0,8 Z" fill="#d97706"/>
+  </marker>
+  <marker id="arrow-blue" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="6" orient="auto-start-reverse">
+    <path d="M0,0 L10,4 L0,8 Z" fill="#2563eb"/>
+  </marker>
+  <marker id="arrow-violet" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="6" orient="auto-start-reverse">
+    <path d="M0,0 L10,4 L0,8 Z" fill="#7c3aed"/>
+  </marker>
+  <marker id="arrow-rose" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="6" orient="auto-start-reverse">
+    <path d="M0,0 L10,4 L0,8 Z" fill="#e11d48"/>
+  </marker>
+  <marker id="arrow-slate" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="6" orient="auto-start-reverse">
+    <path d="M0,0 L10,4 L0,8 Z" fill="#64748b"/>
+  </marker>
+</defs>
+
+<rect width="100%" height="100%" rx="12" fill="#f8fafc" stroke="#e2e8f0"/>
+<text x="500" y="36" text-anchor="middle" class="title">GRPO+DIS&#xFF1A;G=8 + DIS mask &#xB7; &#x4ECD;&#x65E0; Critic</text>
+<text x="500" y="58" text-anchor="middle" class="subtitle">&#x5728; GRPO &#x4E0A;&#x53EA;&#x52A0; DIS &#x5355;&#x56E0;&#x5B50; &#xB7; &#x91CD;&#x8981;&#x6027;&#x6BD4;&#x8D8A;&#x754C;&#x5219; token mask &#xB7; &#x4ECD;&#x53EA;&#x6709; actor_loss</text>
+
+<rect x="30" y="90" width="170" height="200" rx="10" fill="#ecfdf5" stroke="#14b8a6" stroke-width="1.5"/>
+<rect x="30" y="90" width="170" height="32" rx="10" fill="#0d9488"/>
+<rect x="30" y="110" width="170" height="12" fill="#0d9488"/>
+<text x="115.0" y="112" text-anchor="middle" class="badge-text">&#x73AF;&#x5883;</text>
+<text x="115.0" y="148" text-anchor="middle" class="node-text">&#x4EFB;&#x52A1;&#x5206; r</text>
+<text x="115.0" y="170" text-anchor="middle" class="mono" fill="#0f766e">gsm8k</text>
+<text x="115.0" y="192" text-anchor="middle" class="node-text">G=8 &#x91C7;&#x6837;</text>
+<text x="115.0" y="214" text-anchor="middle" class="node-text">&#x7EC4;&#x76F8;&#x5BF9;&#x5F52;&#x4E00;</text>
+<rect x="230" y="90" width="190" height="200" rx="10" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="1.5"/>
+<rect x="230" y="90" width="190" height="32" rx="10" fill="#7c3aed"/>
+<rect x="230" y="110" width="190" height="12" fill="#7c3aed"/>
+<text x="325.0" y="112" text-anchor="middle" class="badge-text">&#x3C0;_rollout vs &#x3C0;_&#x3B8;</text>
+<text x="325.0" y="148" text-anchor="middle" class="node-text">&#x8F68;&#x8FF9;&#x5E26; log&#x3C0;_rollout</text>
+<text x="325.0" y="170" text-anchor="middle" class="node-text">learner &#x91CD;&#x7B97; log&#x3C0;_&#x3B8;</text>
+<text x="325.0" y="192" text-anchor="middle" class="node-text">ratio r=&#x3C0;_&#x3B8;/&#x3C0;_rollout</text>
+<text x="325.0" y="214" text-anchor="middle" class="node-text">&#x5F02;&#x6B65; off-policy</text>
+<rect x="450" y="90" width="220" height="200" rx="10" fill="#fef2f2" stroke="#f43f5e" stroke-width="1.5"/>
+<rect x="450" y="90" width="220" height="32" rx="10" fill="#e11d48"/>
+<rect x="450" y="110" width="220" height="12" fill="#e11d48"/>
+<text x="560.0" y="112" text-anchor="middle" class="badge-text">DIS &#x53CC;&#x8FB9; mask</text>
+<text x="560.0" y="148" text-anchor="middle" class="node-text">lower=0.3 / upper=5</text>
+<text x="560.0" y="170" text-anchor="middle" class="node-text">&#x533A;&#x95F4;&#x5916; weight=0</text>
+<text x="560.0" y="192" text-anchor="middle" class="node-text">&#x4E0D;&#x53E6;&#x5F00;&#x4E00;&#x6761; loss</text>
+<text x="560.0" y="214" text-anchor="middle" class="node-text">&#x9632;&#x91CD;&#x8981;&#x6027;&#x7206;&#x70B8;</text>
+<rect x="700" y="90" width="260" height="200" rx="10" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.5"/>
+<rect x="700" y="90" width="260" height="32" rx="10" fill="#2563eb"/>
+<rect x="700" y="110" width="260" height="12" fill="#2563eb"/>
+<text x="830.0" y="112" text-anchor="middle" class="badge-text">Actor update</text>
+<text x="830.0" y="148" text-anchor="middle" class="node-text">masked IS &#x2192; pg loss</text>
+<text x="830.0" y="170" text-anchor="middle" class="mono" fill="#0f766e">actor_loss` &#x552F;&#x4E00;</text>
+<text x="830.0" y="192" text-anchor="middle" class="node-text">&#x65E0; critic / V</text>
+<text x="830.0" y="214" text-anchor="middle" class="node-text">&#x76EF; dis/mask_ratio</text>
+
+<line x1="200" y1="190" x2="230" y2="190" stroke="#0d9488" stroke-width="1.8" marker-end="url(#arrow-teal)"/>
+<line x1="420" y1="190" x2="450" y2="190" stroke="#7c3aed" stroke-width="1.8" marker-end="url(#arrow-violet)"/>
+<text x="435" y="178" text-anchor="middle" class="arrow-label">ratio</text>
+<line x1="670" y1="190" x2="700" y2="190" stroke="#e11d48" stroke-width="1.8" marker-end="url(#arrow-rose)"/>
+<text x="685" y="178" text-anchor="middle" class="arrow-label">mask</text>
+
+<rect x="40" y="330" width="920" height="250" rx="12" fill="#fff" stroke="#e2e8f0"/>
+<text x="60" y="360" class="node-title">&#x548C;&#x7EAF; GRPO / SAO &#x5DEE;&#x5728;&#x54EA;</text>
+<text x="60" y="390" class="node-text">&#xB7; vs GRPO&#xFF1A;&#x591A;&#x4E86; DIS&#xFF1B;mask_ratio &#x5E94;&#x660E;&#x663E; >0&#xFF08;&#x5426;&#x5219;&#x7B49;&#x4E8E;&#x6CA1;&#x8FC7;&#x6EE4;&#xFF09;</text>
+<text x="60" y="418" class="node-text">&#xB7; vs SAO&#xFF1A;&#x540C;&#x6837;&#x6709; DIS&#xFF0C;&#x4F46;&#x6CA1;&#x6709; critic&#xFF1B;&#x4F18;&#x52BF;&#x4ECD;&#x6765;&#x81EA;&#x7EC4;&#x76F8;&#x5BF9;&#xFF0C;&#x4E0D;&#x662F; V/GAE</text>
+<text x="60" y="446" class="node-text">&#xB7; Loss&#xFF1A;&#x4ECD;&#x53EA;&#x6709; actor&#xFF1B;DIS &#x662F;&#x5BF9; importance &#x7684;&#x786C;&#x95E8;&#xFF0C;&#x4E0D;&#x662F;&#x7B2C;&#x4E8C;&#x6761; critic_loss</text>
+<text x="60" y="474" class="node-text">&#xB7; &#x671F;&#x671B;&#xFF1A;&#x6BD4;&#x88F8; GRPO &#x66F4;&#x6297;&#x584C;&#xFF08;entropy/KL &#x4E0D;&#x90A3;&#x4E48;&#x70B8;&#xFF09;&#xFF0C;reward &#x4ECD;&#x5403; G=8 &#x7EA2;&#x5229;</text>
+<text x="60" y="502" class="node-text">&#xB7; &#x9762;&#x677F;&#xFF1A;critic &#x7A7A;&#xFF1B;&#x53EF;&#x770B; entropy + dis_mask&#xFF08;&#x82E5;&#x65E5;&#x5FD7;&#x6709;&#xFF09;+ reward</text>
+<text x="60" y="540" class="footnote">&#x6D88;&#x878D;&#x89D2;&#x8272;&#xFF1A;&#x5355;&#x72EC;&#x9A8C;&#x8BC1;&#x300C;DIS &#x9632;&#x584C;&#x8FC7;&#x6EE4;&#x5668;&#x300D;&#x5728; G=8 &#x4E0A;&#x7684;&#x8D21;&#x732E;</text>
+</svg>

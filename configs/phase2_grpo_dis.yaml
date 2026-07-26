@@ -1,0 +1,194 @@
+# Phase2 setting: GRPO + DIS = G=8 + same DIS mask as SAO, no critic
+# Instruct-2507 · 24 GPUs · fsdp:d20 + vllm:d4 · xccl · 200 steps
+# 拓扑效率锁定见 docs/04-topo-efficiency.md
+
+experiment_name: sao-cmp-instruct4b
+trial_name: cmp-grpo-dis
+
+seed: 1
+enable_offload: false
+total_train_epochs: 2
+total_train_steps: 200
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 3
+  n_gpus_per_node: 8
+  fileroot: ${SAO_WS}/experiments
+  name_resolve:
+    type: nfs
+    nfs_record_root: ${SAO_WS}/tmp/name_resolve/${experiment_name}/${trial_name}
+
+scheduler:
+  type: ray
+
+rollout:
+  backend: "vllm:d4p1t1"
+  admin_api_key: ${ADMIN_API_KEY}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  max_concurrent_rollouts: 128
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 4
+  enable_rollout_tracing: false
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: false
+  agent:
+    mode: inline
+    admin_api_key: ${ADMIN_API_KEY}
+    export_style: individual
+    turn_discount: 1.0
+
+gconfig:
+  n_samples: 8
+  min_new_tokens: 0
+  max_new_tokens: 512
+  max_tokens: 1024
+  greedy: false
+  temperature: 1.0
+
+actor:
+  backend: "fsdp:d20p1t1"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${MODEL_ROOT}/Qwen3-4B-Instruct-2507
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  attn_impl: sdpa
+  mb_spec:
+    max_tokens_per_mb: 16384
+  optimizer:
+    type: adam
+    lr: 1.0e-6
+    weight_decay: 0.0
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.0
+  eps_clip: 0.3
+  eps_clip_higher: 5.0
+  temperature: ${gconfig.temperature}
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: ratio
+    lower: 0.3
+    upper: 5.0
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  weight_update_mode: xccl
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        NCCL_SOCKET_IFNAME: eth0
+        GLOO_SOCKET_IFNAME: eth0
+        TP_SOCKET_IFNAME: eth0
+        NCCL_IB_DISABLE: "1"
+        NCCL_NET: Socket
+
+ref:
+  backend: ${actor.backend}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  attn_impl: sdpa
+  mb_spec:
+    max_tokens_per_mb: 16384
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+
+vllm:
+  model: ${actor.path}
+  seed: ${seed}
+  skip_tokenizer_init: false
+  dtype: ${actor.dtype}
+  max_model_len: 1024
+  max_num_seqs: 512
+  gpu_memory_utilization: 0.55
+
+train_dataset:
+  # Must be divisible by DP=20; 160 traj = 20 prompts × 8 samples
+  batch_size: 160
+  shuffle: true
+  drop_last: true
+  pin_memory: true
+  num_workers: 4
+  path: ${SAO_WS}/data/gsm8k
+  type: rl
+  max_length: 512
+  scheduling_spec: null
+
+valid_dataset: null
+
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: 50
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+  swanlab:
+    mode: disabled
+  trackio:
+    mode: disabled
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false

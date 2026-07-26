@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+vendor/
+.verify/
+.run/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local secrets / env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Experiment artifacts (never commit)
+experiments/
+logs/
+checkpoints/
+tmp/
+*.npy
+*.pt
+*.ckpt
+returns_*.npy
+wandb/
+swanlab/
+
+# Large / private
+papers/*.pdf
+data/
+*.parquet
+*.arrow
+
+# Internal notes (not published)
+wiki/
+docs/**
+!docs/20260725-math-hard-report.md
+!docs/figures/
+!docs/figures/**

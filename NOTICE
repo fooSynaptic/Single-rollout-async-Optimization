@@ -1,0 +1,6 @@
+Single-rollout Asynchronous Optimization (SAO)
+Copyright 2026 the SAO repository authors
+
+This product includes software developed for integrating with AReaL
+(https://github.com/inclusionAI/AReaL). See vendor/AReaL after bootstrap
+for AReaL's own license terms.

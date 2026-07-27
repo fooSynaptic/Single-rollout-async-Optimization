@@ -1,6 +1,6 @@
 # Single-rollout Asynchronous Optimization
 
-**Unofficial** community re-implementation of **SAO** (*Single-rollout Asynchronous Optimization*, [arXiv:2607.07508](https://arxiv.org/abs/2607.07508)).  
+**Unofficial** re-implementation of **SAO** (*Single-rollout Asynchronous Optimization*, [arXiv:2607.07508](https://arxiv.org/abs/2607.07508)).  
 Not affiliated with or endorsed by the paper authors.
 
 Built on [AReaL](https://github.com/inclusionAI/AReaL). This repository packages algorithm helpers, training configs, an AReaL integration patch, launch/monitor tooling, and MATH experiment results.

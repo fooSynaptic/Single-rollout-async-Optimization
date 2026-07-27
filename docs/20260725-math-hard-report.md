@@ -4,7 +4,7 @@
 > Metric: online `acc = correct / (correct + incorrect)`  
 > Model: `Qwen3-4B-Instruct-2507` · data: MATH → GSM8K-style schema (`scripts/prepare_math.py`) · cap **1000** steps
 
-## 1. What we wanted to test
+## 1. What this rep wanted to test
 
 | Goal | Meaning |
 |------|---------|
@@ -13,7 +13,7 @@
 | Fair same-budget comparison | Report **G=1 vs G=8** separately; under G=1 compare SAO vs single-traj+DIS vs running-mean |
 | Out of scope | Paper table absolute scores · held-out MATH-500 / AIME (not run here) |
 
-## 2. What we ran
+## 2. What tasks ran
 
 | Setting | Factors | Outcome | End-window online acc |
 |---------|---------|---------|------------------------|
@@ -92,7 +92,7 @@ On **MATH-hard · 4B Instruct · 1k steps**:
 - **Same G=1: SAO > single-traj+DIS ≫ running-mean.**  
 - **Best absolute online score remains G=8 GRPO+DIS** — do not treat that as “strictly better algorithm” than G=1 methods.
 
-## 6. Suggested next steps
+## 6. Future steps
 
 1. **Held-out eval**: MATH-500 / AIME.  
 2. **Generation budget**: raise `max_new_tokens` / `max_model_len` toward common math-RL settings.  
